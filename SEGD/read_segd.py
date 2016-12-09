@@ -1,5 +1,8 @@
 from struct import unpack
 from datetime import datetime, timedelta
+from .read_traces import read_traces
+import pandas
+import numpy
 
 def pbcd2dec(pbcd):
     ''' Returns decimal number from packed Binary Coded Decimal'''
@@ -12,7 +15,7 @@ def pbcd2dec(pbcd):
     
     return decode
 
-class SEGD_trace_header(object):
+class SEGD_trace(object):
 
     def __init__(self,hdr_block):
         
@@ -25,7 +28,8 @@ class SEGD_trace_header(object):
         mp_factor  =   bin(ch_set_hdr[7])+bin(ch_set_hdr[6])[2:].zfill(8)
         
 
-        # If the gain field is set to zero and the above field will only be 10 characters long
+        # If the gain field is set to zero and the above field will only be 10 characters long.
+        # For the calculation below, the number needs to be padded to 12 bits.
         if mp_factor=='0b000000000':
             mp_factor = '0b0000000000000000'
         
@@ -65,7 +69,7 @@ class SEGD_trace_header(object):
 
         return readable_output
 
-class SEGD_header(object):
+class SEGD(object):
 
     def __init__(self,file_name = ''):
         self.file_name = file_name
@@ -82,7 +86,7 @@ class SEGD_header(object):
         # General header block #2
         gen_hdr_2   =   unpack('>32B',f.read(32))
         # General header block #3
-        gen_hdr_3   =   unpack('>32B',f.read(32))
+        gen_hdr_3   =   f.read(32)
         
         
         # Header block #1
@@ -103,7 +107,7 @@ class SEGD_header(object):
 
         self.dt             =   divmod(gen_hdr_1[22],16)[0]*1e-3 # skip fractions
         self.trace_length   =   (divmod(gen_hdr_1[25],16)[1]*10+pbcd2dec(gen_hdr_1[26:27])/10.)*1.024
-
+        
         self.channel_sets   =   pbcd2dec(gen_hdr_1[28:29])
         self._skew_blocks   =   pbcd2dec(gen_hdr_1[29:30])
 
@@ -124,8 +128,11 @@ class SEGD_header(object):
     
         self.segd_rev   =   pbcd2dec(gen_hdr_2[10:11])+pbcd2dec(gen_hdr_2[11:12])/10.
         self._extended_trace_length     =   gen_hdr_2[31]
+        
+        # rev 3.0 introduced a fine grain timestamp in bytes 1-8 in Header block #3
+        self._gps_timestamp = unpack('>q',gen_hdr_3[:8])
 
-        self.channel_set_headers = [SEGD_trace_header(f.read(32)) for _ in range(self.channel_sets)]
+        self.channel_set_headers = [SEGD_trace(f.read(32)) for _ in range(self.channel_sets)]
 
         # skip Host recording sys, Line ID for cables and Shot time/reel number
         f.seek(32*3,1)
@@ -135,8 +142,63 @@ class SEGD_header(object):
         self.survey         =   unpack('>32s',f.read(32))[0].split(b'\x00')[0]
         self.project        =   unpack('>32s',f.read(32))[0].split(b'\x00')[0]
 
-    def __str__(self):
+        # jump to first trace hdr (4 default hdr blocks plus extended and external hdr blocks).
+        f.seek((self._extended_hdr_blocks+self._external_hdr_blocks-7)*32,1)
+        self._channel_set_entry_points(f)
+    
+        f.close()
 
+    def _channel_set_entry_points(self,file_ptr):
+        
+        for ch_hdr in self.channel_set_headers:
+            
+            # store entry point position
+            ch_hdr._file_ptr = file_ptr.tell()
+            
+            # check extended header length
+            trc_hdr_1           =   unpack('>20B',file_ptr.read(20))
+            ch_hdr._hdr_length  =   20 +32*trc_hdr_1[9]
+            
+            # calculate number of samples per trace
+            # can be extracted from extended header byte pos 7-10
+            ch_hdr._samples = int((ch_hdr.stop - ch_hdr.start)/self.dt*1e-3)
+            
+            # calculate trace length for ease of use with a file pointer
+            if self.segd_format == 8058:
+                # 32 bit data
+                ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*4
+            else:
+                # 24 bit data
+                ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*3
+            
+            # jumpt to next channel set
+            file_ptr.seek(ch_hdr.channels*ch_hdr._trace_length-20,1)
+                
+    def data(self,channel_set):
+        '''Returns a numpy array of the data in teh selected channelset'''
+        f = open(self.file_name,'rb')
+    
+        f.seek(self.channel_set_headers[channel_set]._file_ptr,0)
+        samples     = self.channel_set_headers[channel_set]._samples
+        traces      = self.channel_set_headers[channel_set].channels
+        hdr_length  = self.channel_set_headers[channel_set]._hdr_length
+    
+        return read_traces(f,samples,traces,hdr_length)
+    
+    def dataFrame(self,channel_set):
+        '''Returns pandas Multiindex for requested dataset'''
+
+        data = pandas.DataFrame(data=self.data(channel_set).T)
+        data.index = pandas.MultiIndex.from_product([[self.file_number],
+                        numpy.linspace(self.channel_set_headers[channel_set].start*1e-3,
+                                       self.channel_set_headers[channel_set].stop*1e-3,
+                                       self.channel_set_headers[channel_set]._samples)],
+                                        names = ['FFID','time'])
+    
+        return data
+
+    def __str__(self):
+    
         # Global header information
         readable_output = 'SEG-D file header:\n\n'
         readable_output += 'File name:   \t\t {0}\n'.format(self.file_name)
@@ -144,19 +206,18 @@ class SEGD_header(object):
         readable_output += 'File Format: \t\t {0} rev {1}\n'.format(self.segd_format,self.segd_rev)
         readable_output += 'Time stamp:  \t\t {0}\n'.format(self.time_stamp.ctime())
         readable_output += 'Trace length:\t\t {0}s\n'.format(self.trace_length)
-        readable_output += 'Sample rate: \t\t {0}s\n\n'.format(self.dt)
-
+        readable_output += 'Sample rate: \t\t {0}s\n\n\n'.format(self.dt)
+        
         for idx,ch_set in enumerate(self.channel_set_headers):
             readable_output += 'Channel set {0}:\n'.format(idx)
             readable_output += ch_set.__str__()
-
+        
         return readable_output
-
 
 def read_header(file):
 
     '''Returns SEGD_header object'''
 
-    header = SEGD_header(file)
+    header = SEGD(file)
 
     return header

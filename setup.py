@@ -1,6 +1,6 @@
-
-
-from setuptools import setup
+from setuptools import setup, Extension
+from Cython.Build import cythonize
+import numpy
 
 setup(
       name = 'SEGD',
@@ -20,4 +20,6 @@ setup(
       keywords = 'seismic SEGD',
       packages = ['SEGD'],
       install_requires = ['cython','numpy','datetime'],
+      ext_modules = cythonize([Extension('SEGD.read_traces',['SEGD/read_traces.pyx']
+                               ,include_dirs=[numpy.get_include()])])
       )
