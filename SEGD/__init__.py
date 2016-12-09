@@ -1,4 +1,1 @@
-
-
-from .read_header import read_header
-from .read_data import read_data
+from .read_segd import read_header, SEGD
